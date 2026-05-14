@@ -1,4 +1,5 @@
 import pyspark.sql.functions as F
+from pyspark.sql.window import Window
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.types import DoubleType, IntegerType, StringType
 
@@ -36,18 +37,26 @@ class CustomCode:
         flight_start_unix = campaign_row["flight_start_unix"]
         flight_end_unix = campaign_row["flight_end_unix"]
         lookback_start_unix = campaign_row["lookback_start_unix"]
+
+        # May 13 - Conversion Deconfliction
+        # 1 conversion - multiple rampIDs; pick the one with most conversions associated to it
+        rampid_txn_count = conversion_df.groupBy("lr_id").agg(F.count("*").alias("txn_count"))
+        deconflict_w = Window.partitionBy("order_id").orderBy(F.desc("txn_count"))
+        conversion_df = conversion_df.join(rampid_txn_count, "lr_id")\
+                                     .withColumn("rownum", F.row_number().over(deconflict_w))\
+                                     .filter(F.col("rownum") == 1)\
+                                     .drop("rownum", "txn_count")
+        # End of May 13 - Conversion Deconfliction
     
         mapped_exposure_df = exposure_df.filter(F.col("campaign_id") == CAMPAIGN_ID)\
                                         .filter((F.col("ts") >= F.lit(flight_start_unix)) & \
                                                 (F.col("ts") <= F.lit(flight_end_unix)))\
                                         .join(map_df, exposure_df["tp_id"] == map_df["rampid_meta"])
-        exposure_agg_df = mapped_exposure_df.select(F.col("rampid_rmn").alias("lr_id"),\
-                                                    F.col("ts").alias("exposure_ts"),
-                                                    F.col("device_platform"),
-                                                    F.col("impression_device"),
-                                                    F.col("placement_type"))\
-                                            .groupBy("lr_id")\
-                                            .agg(F.min("exposure_ts").alias("min_exposure_ts"),
+        exposure_agg_df = mapped_exposure_df.join(demographic_df.select("rampid", "addressLink"),
+                                                  mapped_exposure_df["rampid_dpm"] == demographic_df["rampid"], "left")\
+                                            .filter(F.col("addressLink").isNotNull())\
+                                            .groupBy("addressLink")\
+                                            .agg(F.min("ts").alias("min_exposure_ts"),
                                                  F.count("*").alias("exposure_frequency"),
                                                  F.first("device_platform").alias("device_platform"),
                                                  F.first("impression_device").alias("impression_device"),
@@ -59,11 +68,10 @@ class CustomCode:
         pre_campaign_exposed = exposure_df.filter((F.col("ts") >= F.lit(lookback_start_unix)) &
                                                   (F.col("ts") <  F.lit(flight_start_unix)))\
                                           .join(map_df, exposure_df["tp_id"] == map_df["rampid_meta"])\
-                                          .select(F.col("rampid_rmn").alias("lr_id"),
-                                                  F.col("device_platform"),
-                                                  F.col("impression_device"),
-                                                  F.col("placement_type"))\
-                                          .groupBy("lr_id")\
+                                          .join(demographic_df.select("rampid", "addressLink"),
+                                                F.col("rampid_dpm") == demographic_df["rampid"], "left")\
+                                          .filter(F.col("addressLink").isNotNull())\
+                                          .groupBy("addressLink")\
                                           .agg(F.first("device_platform").alias("device_platform"),
                                                F.first("impression_device").alias("impression_device"),
                                                F.first("placement_type").alias("placement_type"))
@@ -87,10 +95,30 @@ class CustomCode:
                                         F.min(F.col("transaction_timestamp_unix")).alias("first_seen"), \
                                         F.first(F.col("flight_start_unix")).alias("flight_start_unix"))
 
+        features_df = features_df.join(map_df.select("rampid_rmn", "rampid_dpm"), 
+                                       features_df["lr_id"] == map_df["rampid_rmn"], "left" )\
+                                 .join(demographic_df.select("rampid", "addressLink", "gender", "age", "state", "hh_income"),
+                                       F.col("rampid_dpm") == demographic_df["rampid"], "left")\
+                                 .filter(F.col("addressLink").isNotNull())
+
+        features_df = features_df.groupBy("addressLink")\
+                                 .agg(F.sum("pre_campaign_total_order_value").alias("pre_campaign_total_order_value"),
+                                      F.sum("pre_campaign_total_quantity").alias("pre_campaign_total_quantity"),
+                                      F.sum("pre_campaign_conversion_count").alias("pre_campaign_conversion_count"),
+                                      F.max("pre_campaign_last_txn_time").alias("pre_campaign_last_txn_time"),
+                                      F.sum("post_campaign_total_order_value").alias("post_campaign_total_order_value"),
+                                      F.min("post_campaign_first_seen").alias("post_campaign_first_seen"),
+                                      F.min("first_seen").alias("first_seen"),
+                                      F.first("flight_start_unix").alias("flight_start_unix"),
+                                      F.first("gender").alias("gender"),
+                                      F.first("age").alias("age"),
+                                      F.first("state").alias("state"),
+                                      F.first("hh_income").alias("hh_income"))
+
         features_df = features_df.withColumn('pre_campaign_tenure_days', (F.col("flight_start_unix") - F.col("first_seen")) / F.lit(24 * 60 * 60))\
                                  .withColumn('pre_campaign_conversion_recency', (F.col("flight_start_unix") - F.col("pre_campaign_last_txn_time")) / F.lit(24 * 60 * 60))\
                                  .withColumn('pre_campaign_avg_order_value', F.col("pre_campaign_total_order_value") / F.when(F.col("pre_campaign_conversion_count") > 0, \
-                                                                             F.col("pre_campaign_conversion_count")).otherwise(0))\
+                                                                             F.col("pre_campaign_conversion_count")).otherwise(1))\
                                  .withColumn('pre_campaign_avg_items_per_order', F.col("pre_campaign_total_quantity") / F.when(F.col("pre_campaign_conversion_count") > 0, \
                                                                                                                                F.col("pre_campaign_conversion_count")).otherwise(1))\
                                  .withColumn('pre_campaign_has_conversion', F.when(F.col("pre_campaign_conversion_count") > 0, F.lit(1)).otherwise(F.lit(0)))\
@@ -108,7 +136,7 @@ class CustomCode:
         #                                                                         .otherwise(F.col("pre_campaign_total_order_value")))
 
         # Treatment = 1 if user was exposed during campaign, and first exposure happened before first conversion in the campaign window
-        final_df = features_df.join(exposure_agg_df, "lr_id", "left")
+        final_df = features_df.join(exposure_agg_df, "addressLink", "left")
         final_df = final_df.withColumn("treatment", F.when((F.col("min_exposure_ts").isNotNull()) & \
                                                            (F.col("post_campaign_first_seen").isNull() | \
                                                             (F.col("min_exposure_ts") < F.col("post_campaign_first_seen"))), 
@@ -119,15 +147,17 @@ class CustomCode:
                                                                           .otherwise(F.lit(0.0)))
         
         
-        q2_users = features_df.filter(F.col("post_campaign_total_order_value") > 0).select("lr_id")
-        q2_df = exposure_agg_df.join(q2_users, "lr_id", "left_anti")\
-                               .join(features_df.drop("post_campaign_first_seen"), "lr_id", "left")\
+        q2_users = features_df.filter(F.col("post_campaign_total_order_value") > 0).select("addressLink")
+        q2_df = exposure_agg_df.join(q2_users, "addressLink", "left_anti")\
+                               .join(features_df.drop("post_campaign_first_seen"), "addressLink", "left")\
+                               .withColumn("post_campaign_total_order_value", F.lit(0))\
                                .withColumn("treatment", F.lit(1))\
                                .withColumn("days_into_campaign_at_exposure", (F.col("min_exposure_ts") - F.lit(flight_start_unix)) / F.lit(24 * 60 * 60))\
                                .fillna(0).fillna(999, subset=["pre_campaign_conversion_recency"])
         
-        q4_users = pre_campaign_exposed.join(final_df.select("lr_id"), pre_campaign_exposed["lr_id"] == final_df["lr_id"], "left_anti")\
-                                       .join(q2_df, "lr_id", "left_anti")
+        q4_users = pre_campaign_exposed.join(final_df.select("addressLink"), "addressLink", "left_anti")\
+                                       .join(q2_df.select("addressLink"), "addressLink", "left_anti")\
+                                       .join(demographic_df.select("rampid", "addressLink", "gender", "age", "state", "hh_income").drop_duplicates(["addressLink"]), "addressLink", "left")
         # Build Q4 DataFrame with same schema as final_df
         # All product features are zero — these users have no product purchase history
         q4_df = q4_users.withColumn("pre_campaign_total_order_value",    F.lit(0.0))\
@@ -144,16 +174,16 @@ class CustomCode:
                         .withColumn("min_exposure_ts",                   F.lit(None).cast("long"))\
                         .withColumn("post_campaign_first_seen",          F.lit(None).cast("long"))
 
-        final_df = final_df.join(map_df, final_df["lr_id"] == map_df["rampid_rmn"], "left")
-        final_df = final_df.join(demographic_df, F.col("rampid_dpm") == demographic_df["rampid"],"left")
-        q2_df = q2_df.join(map_df, q2_df["lr_id"] == map_df["rampid_rmn"], "left")
-        q2_df = q2_df.join(demographic_df, F.col("rampid_dpm") == demographic_df["rampid"],"left")
-        q4_df = q4_df.join(map_df, q4_df["lr_id"] == map_df["rampid_rmn"], "left")
-        q4_df = q4_df.join(demographic_df, F.col("rampid_dpm") == demographic_df["rampid"],"left")
+        # final_df = final_df.join(map_df, final_df["lr_id"] == map_df["rampid_rmn"], "left")
+        # final_df = final_df.join(demographic_df, F.col("rampid_dpm") == demographic_df["rampid"],"left")
+        # q2_df = q2_df.join(map_df, q2_df["lr_id"] == map_df["rampid_rmn"], "left")
+        # q2_df = q2_df.join(demographic_df, F.col("rampid_dpm") == demographic_df["rampid"],"left")
+        # q4_df = q4_df.join(map_df, q4_df["lr_id"] == map_df["rampid_rmn"], "left")
+        # q4_df = q4_df.join(demographic_df, F.col("rampid_dpm") == demographic_df["rampid"],"left")
 
         # final_df = final_df.join(demographic_df, final_df["lr_id"] == demographic_df["rampid"], "left")
 
-        output_cols = [F.col("lr_id"), 
+        output_cols = [F.col("addressLink"), 
                        F.col("pre_campaign_total_order_value").cast(DoubleType()), 
                        F.col("post_campaign_total_order_value").cast(DoubleType()), 
                        F.col("treatment").cast(IntegerType()), 
